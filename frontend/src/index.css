@@ -1,0 +1,64 @@
+@import 'tailwindcss';
+
+@theme {
+  /* Indic, Arabic and CJK scripts fall back to system fonts that cover them. */
+  --font-sans: 'Plus Jakarta Sans Variable', 'Noto Sans', 'Nirmala UI', ui-sans-serif, system-ui, sans-serif;
+
+  --color-brand-50: #fff5ee;
+  --color-brand-100: #ffe8d8;
+  --color-brand-200: #ffcfae;
+  --color-brand-300: #ffae7a;
+  --color-brand-400: #ff8a47;
+  --color-brand-500: #f76a1d;
+  --color-brand-600: #e05510;
+  --color-brand-700: #b94310;
+  --color-brand-900: #5a2310;
+
+  --color-ink-900: #1f1915;
+  --color-ink-700: #4a3f38;
+  --color-ink-500: #7f7067;
+  --color-ink-400: #a3948a;
+
+  --color-canvas: #f7ede5;
+
+  --shadow-card: 0 1px 0 rgb(255 255 255 / 0.9) inset, 0 22px 50px -26px rgb(141 72 30 / 0.3);
+  --shadow-glow: 0 10px 24px -8px rgb(247 106 29 / 0.6);
+
+  --animate-pulse-ring: pulse-ring 1.8s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+
+  @keyframes pulse-ring {
+    from {
+      transform: scale(0.95);
+      opacity: 0.8;
+    }
+    to {
+      transform: scale(1.55);
+      opacity: 0;
+    }
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    min-height: 100dvh;
+    background-color: var(--color-canvas);
+    background-image:
+      radial-gradient(56rem 30rem at 50% -10rem, rgb(255 255 255 / 0.95), transparent 70%),
+      radial-gradient(40rem 30rem at 100% 0%, rgb(255 208 176 / 0.55), transparent 70%),
+      radial-gradient(40rem 32rem at 0% 85%, rgb(255 222 200 / 0.65), transparent 70%);
+    background-attachment: fixed;
+    color: var(--color-ink-900);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}

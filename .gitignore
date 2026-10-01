@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# Shared translations (server-side storage)
+data/
