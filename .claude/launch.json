@@ -4,20 +4,31 @@
     {
       "name": "app",
       "runtimeExecutable": "audiotrans/Scripts/python.exe",
-      "runtimeArgs": ["app.py"],
+      "runtimeArgs": [
+        "app.py"
+      ],
       "port": 5001
     },
     {
       "name": "app-alt-port",
       "runtimeExecutable": "audiotrans/Scripts/python.exe",
-      "runtimeArgs": ["app.py"],
-      "env": { "PORT": "5002" },
+      "runtimeArgs": [
+        "app.py"
+      ],
+      "env": {
+        "PORT": "5002"
+      },
       "port": 5002
     },
     {
       "name": "frontend-dev",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "frontend", "run", "dev"],
+      "runtimeArgs": [
+        "--prefix",
+        "frontend",
+        "run",
+        "dev"
+      ],
       "port": 5173
     }
   ]

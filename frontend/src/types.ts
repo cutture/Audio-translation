@@ -67,3 +67,22 @@ export interface SharedTranslation {
   target_language: Language
   audio_url: string
 }
+
+export interface User {
+  username: string
+}
+
+export interface OAuthProvider {
+  id: string
+  name: string
+}
+
+export interface SessionInfo {
+  user: User | null
+  /** Anyone may create an account. */
+  signup_enabled: boolean
+  /** External sign-in providers configured on the server (Google, GitHub, …). */
+  providers: OAuthProvider[]
+  /** Nobody can sign in until the admin creates the first account. */
+  setup_required: boolean
+}

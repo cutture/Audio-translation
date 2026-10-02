@@ -6,59 +6,8 @@ import pytest
 
 import app as app_module
 from app import MAX_AUDIO_BYTES, MAX_SPEECH_CHARS, MAX_TEXT_CHARS, create_app
-from translation_service import IdentifiedLanguage, Transcription, Translation
-
-
-class FakeService:
-    transcription_model = "whisper-1"
-    translation_model = "gpt-4.1"
-    detection_model = "gpt-4.1-mini"
-    speech_model = "gpt-4o-mini-tts"
-    speech_voice = "marin"
-
-    def __init__(self):
-        self.transcription = Transcription("नमस्ते दुनिया", "hindi", 2.5)
-        self.identified = IdentifiedLanguage("hi", "Hindi")
-        self.identify_error = None
-        self.translation = Translation("Hello world", "gpt-4.1-2025-04-14", False)
-        self.error = None
-        self.calls = []
-
-    def transcribe(self, filename, data, content_type):
-        self.calls.append(("transcribe", filename, data, content_type))
-        if self.error:
-            raise self.error
-        return self.transcription
-
-    def identify_language(self, text):
-        self.calls.append(("identify", text))
-        if self.identify_error:
-            raise self.identify_error
-        return self.identified
-
-    def translate(self, text, target, source=None):
-        self.calls.append(("translate", text, target, source))
-        if self.error:
-            raise self.error
-        return self.translation
-
-    def speak(self, text, language):
-        self.calls.append(("speak", text, language.code))
-        if self.error:
-            raise self.error
-        return b"ID3-fake-mp3"
-
-
-@pytest.fixture
-def service():
-    return FakeService()
-
-
-@pytest.fixture
-def client(service, tmp_path):
-    app = create_app(service, data_dir=tmp_path)
-    app.config["TESTING"] = True
-    return app.test_client()
+from conftest import create_user, sign_in
+from translation_service import IdentifiedLanguage, Transcription
 
 
 def upload(client, data=b"fake-audio", filename="clip.mp3", content_type="audio/mpeg"):
@@ -268,7 +217,10 @@ def test_openai_errors_become_json_errors(client, service, error, status, code):
 
 def test_missing_api_key_is_reported_without_breaking_config(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    client = create_app(data_dir=tmp_path).test_client()
+    app = create_app(data_dir=tmp_path)
+    create_user(app, "tester")
+    client = app.test_client()
+    sign_in(client, "tester")
 
     assert client.get("/api/config").status_code == 200
     res = upload(client)

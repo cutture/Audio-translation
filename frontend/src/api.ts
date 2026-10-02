@@ -1,4 +1,7 @@
-import type { AppConfig, SharedTranslation, Transcription, TranslationResult } from './types'
+import type { AppConfig, SessionInfo, SharedTranslation, Transcription, TranslationResult, User } from './types'
+
+/** Fired when the server rejects the session (expired, or the account changed). */
+export const SESSION_EXPIRED_EVENT = 'audio-translator:session-expired'
 
 export class ApiError extends Error {
   readonly status: number
@@ -30,6 +33,9 @@ async function send(url: string, init?: RequestInit): Promise<Response> {
     throw new ApiError('Could not reach the server. Make sure the backend is running.', 0, 'network_error')
   }
   if (!response.ok) {
+    if (response.status === 401 && !url.startsWith('/api/auth/')) {
+      window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT))
+    }
     const body = await response.json().catch(() => null)
     throw new ApiError(
       body?.error?.message ?? `Request failed with status ${response.status}.`,
@@ -46,6 +52,27 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 function postJson(body: unknown, signal?: AbortSignal): RequestInit {
   return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal }
+}
+
+export function fetchSession(signal?: AbortSignal) {
+  return request<SessionInfo>('/api/auth/me', { signal })
+}
+
+export function signIn(username: string, password: string) {
+  return request<{ user: User }>('/api/auth/login', postJson({ username, password }))
+}
+
+export function signUp(username: string, password: string) {
+  return request<{ user: User }>('/api/auth/signup', postJson({ username, password }))
+}
+
+/** Full-page navigation: the server redirects to the provider and back. */
+export function oauthStartUrl(providerId: string): string {
+  return `/api/auth/oauth/${encodeURIComponent(providerId)}/start`
+}
+
+export async function signOut(): Promise<void> {
+  await send('/api/auth/logout', { method: 'POST' })
 }
 
 export function fetchConfig(signal?: AbortSignal) {

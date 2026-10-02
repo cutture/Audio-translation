@@ -2,27 +2,46 @@
 
 Serves a small JSON API plus the built React frontend (frontend/dist):
 
+    GET  /api/auth/me               who is signed in, plus the available sign-in options
+    POST /api/auth/signup           JSON {username, password} -> creates an account and signs in
+    POST /api/auth/login            JSON {username, password} -> starts a session
+    POST /api/auth/logout           ends the session
+    GET  /api/auth/oauth/<provider>/start      redirects to Google/GitHub to sign in
+    GET  /api/auth/oauth/<provider>/callback   where the provider sends the user back
     GET  /api/config                supported languages, limits and model names
-    POST /api/transcribe            multipart audio -> transcript + detected language
-    POST /api/translate             JSON {text, source_language?, target_language} -> translation
-    POST /api/speech                JSON {text, language} -> MP3 of the text read aloud
-    POST /api/shares                JSON translation -> {id, url} share link
-    GET  /api/shares/<id>           a shared translation
-    GET  /api/shares/<id>/audio     its MP3 (?download=1 to save it)
+    POST /api/transcribe            multipart audio -> transcript + detected language      (signed in)
+    POST /api/translate             JSON {text, source_language?, target_language}         (signed in)
+    POST /api/speech                JSON {text, language} -> MP3 of the text read aloud    (signed in)
+    POST /api/shares                JSON translation -> {id, url} share link               (signed in)
+    GET  /api/shares/<id>           a shared translation                                   (public)
+    GET  /api/shares/<id>/audio     its MP3 (?download=1 to save it)                       (public)
     GET  /s/<id>                    the share page (rendered by the frontend)
+
+Accounts can also be managed from the command line: `flask --app app users --help`.
 """
 
+import functools
 import logging
+import math
 import os
 import re
+import secrets
+import time
+from datetime import timedelta
 from pathlib import Path
 
+import click
 import openai
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, g, jsonify, redirect, request, send_file, send_from_directory, session, url_for
+from flask.sessions import SecureCookieSessionInterface
+from flask_limiter import Limiter, RateLimitExceeded
+from flask_limiter.util import get_remote_address
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from languages import SUPPORTED_LANGUAGES, Language, get_language, resolve_detected_language
+from oauth_login import OAuthLogin, OAuthLoginError
 from share_store import ShareStore
 from translation_service import (
     DEFAULT_DETECTION_MODEL,
@@ -33,6 +52,7 @@ from translation_service import (
     Transcription,
     TranslationService,
 )
+from user_store import UsernameTaken, UserStore
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -45,6 +65,18 @@ MAX_AUDIO_BYTES = 25 * 1024 * 1024  # OpenAI's upload limit for audio
 MAX_RECORDING_SECONDS = 10 * 60
 MAX_TEXT_CHARS = 50_000
 MAX_SPEECH_CHARS = 20_000
+
+# Override any of these with RATE_LIMIT_<NAME>, e.g. RATE_LIMIT_TRANSLATE="10 per minute; 100 per day".
+DEFAULT_RATE_LIMITS = {
+    "login": "5 per minute; 50 per day",  # per IP address, against password guessing
+    "signup": "5 per hour; 20 per day",  # per IP address; only accounts actually created count
+    "oauth": "20 per minute",  # per IP address
+    "transcribe": "10 per minute; 200 per day",  # the rest are per signed-in user
+    "translate": "30 per minute; 500 per day",
+    "speech": "30 per minute; 500 per day",
+    "share": "10 per minute; 100 per day",
+    "share_audio": "30 per minute",  # per IP address; share pages are public
+}
 
 # Formats accepted by the OpenAI transcription API.
 AUDIO_EXTENSIONS = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".oga", ".ogg", ".wav", ".webm"}
@@ -115,10 +147,103 @@ def required_language(payload: dict, name: str) -> Language:
     return language
 
 
-def create_app(service: TranslationService | None = None, data_dir: Path | None = None) -> Flask:
+# --- sessions ------------------------------------------------------------------
+
+class LazySecretSessionInterface(SecureCookieSessionInterface):
+    """Resolves the signing key on first use, so importing the app never touches the disk."""
+
+    def __init__(self, load_key):
+        self._load_key = load_key
+
+    def get_signing_serializer(self, app):
+        if not app.secret_key:
+            app.secret_key = self._load_key()
+        return super().get_signing_serializer(app)
+
+
+def load_or_create_secret_key(directory: Path) -> str:
+    """Use SECRET_KEY if set; otherwise a random key kept in the data directory so
+    sessions survive restarts."""
+    path = Path(directory) / "secret_key"
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_hex(32)
+    try:
+        with path.open("x", encoding="utf-8") as file:
+            file.write(key)
+    except FileExistsError:  # another worker created it first
+        return path.read_text(encoding="utf-8").strip()
+    return key
+
+
+def public_user(user: dict | None) -> dict | None:
+    return {"username": user["username"]} if user else None
+
+
+def credentials(payload: dict) -> tuple[str, str]:
+    username, password = payload.get("username"), payload.get("password")
+    if not isinstance(username, str) or not isinstance(password, str) or not username.strip() or not password:
+        raise ApiError(400, "missing_credentials", "Enter your username and password.")
+    return username.strip(), password
+
+
+def start_session(user: dict) -> None:
+    session.clear()
+    session.permanent = True
+    session["uid"] = user["id"]
+    session["sv"] = user["session_version"]
+
+
+def login_required(view):
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        if g.get("user") is None:
+            raise ApiError(401, "unauthorized", "Please sign in to continue.")
+        return view(*args, **kwargs)
+
+    return wrapper
+
+
+def describe_wait(seconds: int) -> str:
+    if seconds < 90:
+        return f"{seconds} second{'' if seconds == 1 else 's'}"
+    if seconds < 90 * 60:
+        return f"{round(seconds / 60)} minutes"
+    return f"{round(seconds / 3600)} hours"
+
+
+def create_app(
+    service: TranslationService | None = None,
+    data_dir: Path | None = None,
+    config: dict | None = None,
+    oauth_login: OAuthLogin | None = None,
+) -> Flask:
     app = Flask(__name__, static_folder=str(FRONTEND_DIST), static_url_path="")
-    # Leave headroom for multipart overhead; the audio itself is checked against MAX_AUDIO_BYTES.
-    app.config["MAX_CONTENT_LENGTH"] = MAX_AUDIO_BYTES + 512 * 1024
+    data_dir = Path(data_dir) if data_dir else DATA_DIR
+    app.config.update(
+        # Leave headroom for multipart overhead; the audio itself is checked against MAX_AUDIO_BYTES.
+        MAX_CONTENT_LENGTH=MAX_AUDIO_BYTES + 512 * 1024,
+        SECRET_KEY=os.getenv("SECRET_KEY") or None,
+        SESSION_COOKIE_NAME="audio_translator_session",
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",  # the browser won't send it with cross-site POSTs (CSRF)
+        SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE") == "1",  # set to 1 when served over HTTPS
+        PERMANENT_SESSION_LIFETIME=timedelta(days=int(os.getenv("SESSION_DAYS", "7"))),
+        # Anyone can create an account unless this is turned off (then only the admin can, via the CLI).
+        ALLOW_SIGNUPS=os.getenv("ALLOW_SIGNUPS", "1") != "0",
+    )
+    app.config.update(config or {})
+    app.session_interface = LazySecretSessionInterface(lambda: load_or_create_secret_key(data_dir))
+
+    # Behind a reverse proxy (most hosting platforms), trust its X-Forwarded-* headers so
+    # rate limits see the visitor's IP address rather than the proxy's.
+    trusted_proxies = int(os.getenv("TRUSTED_PROXIES", "0"))
+    if trusted_proxies:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxies, x_proto=trusted_proxies, x_host=trusted_proxies)
+
+    oauth_login = oauth_login or OAuthLogin()
+    oauth_login.init_app(app)
 
     models = {
         "transcription": service.transcription_model if service
@@ -132,7 +257,7 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
     }
     # Created lazily so the UI and /api/config work without a key, and importing
     # this module doesn't touch the disk.
-    lazy = {"service": service, "shares": None}
+    lazy = {"service": service, "shares": None, "users": None}
 
     def get_service() -> TranslationService:
         if lazy["service"] is None:
@@ -152,14 +277,123 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
 
     def get_shares() -> ShareStore:
         if lazy["shares"] is None:
-            lazy["shares"] = ShareStore(data_dir or DATA_DIR)
+            lazy["shares"] = ShareStore(data_dir)
         return lazy["shares"]
+
+    def get_users() -> UserStore:
+        if lazy["users"] is None:
+            lazy["users"] = UserStore(data_dir)
+        return lazy["users"]
 
     def find_share(share_id: str) -> dict:
         share = get_shares().get(share_id)
         if share is None:
             raise ApiError(404, "not_found", "This shared translation doesn't exist.")
         return share
+
+    # Registered before the rate limiter so per-user limits know who is asking.
+    @app.before_request
+    def load_user():
+        g.user = None
+        if not request.path.startswith("/api/") or "uid" not in session:
+            return
+        user = get_users().get(session["uid"])
+        # A changed password (or a deleted account) invalidates sessions issued before it.
+        if user is None or user["session_version"] != session.get("sv"):
+            session.clear()
+            return
+        g.user = user
+
+    def user_key() -> str:
+        return f"user:{g.user['id']}" if g.get("user") else get_remote_address()
+
+    rate_limits = {name: os.getenv(f"RATE_LIMIT_{name.upper()}", default) for name, default in DEFAULT_RATE_LIMITS.items()}
+    limiter = Limiter(
+        key_func=get_remote_address,
+        app=app,
+        # memory:// is per process; use e.g. redis://localhost:6379 when running several workers.
+        storage_uri=os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
+        strategy="moving-window",
+        headers_enabled=True,
+    )
+
+    # --- auth ------------------------------------------------------------------
+
+    @app.get("/api/auth/me")
+    def me():
+        signups = app.config["ALLOW_SIGNUPS"]
+        return jsonify(
+            user=public_user(g.user),
+            signup_enabled=signups,
+            providers=oauth_login.available(),
+            # Nobody can get in until the admin creates the first account.
+            setup_required=not signups and get_users().count() == 0,
+        )
+
+    @app.post("/api/auth/signup")
+    @limiter.limit(rate_limits["signup"], deduct_when=lambda response: response.status_code == 201)
+    def signup():
+        if not app.config["ALLOW_SIGNUPS"]:
+            raise ApiError(403, "signup_disabled", "New accounts can only be created by the administrator.")
+        username, password = credentials(json_body())
+        try:
+            user = get_users().create(username, password)
+        except UsernameTaken as err:
+            raise ApiError(409, "username_taken", str(err)) from None
+        except ValueError as err:
+            raise ApiError(400, "invalid_account", str(err)) from None
+        start_session(user)
+        return jsonify(user=public_user(user)), 201
+
+    @app.post("/api/auth/login")
+    @limiter.limit(rate_limits["login"])
+    def login():
+        username, password = credentials(json_body())
+        user = get_users().authenticate(username, password)
+        if user is None:
+            raise ApiError(401, "invalid_credentials", "Incorrect username or password.")
+        start_session(user)
+        return jsonify(user=public_user(user))
+
+    @app.get("/api/auth/oauth/<provider>/start")
+    @limiter.limit(rate_limits["oauth"])
+    def oauth_start(provider: str):
+        if not oauth_login.has(provider):
+            raise ApiError(404, "not_found", "This sign-in method isn't available.")
+        # Must match a redirect URI registered with the provider.
+        return oauth_login.redirect(provider, url_for("oauth_callback", provider=provider, _external=True))
+
+    @app.get("/api/auth/oauth/<provider>/callback")
+    @limiter.limit(rate_limits["oauth"])
+    def oauth_callback(provider: str):
+        # The browser lands here, so problems are reported to the sign-in page, not as JSON.
+        if not oauth_login.has(provider):
+            return redirect("/?auth_error=oauth_unavailable")
+        try:
+            profile = oauth_login.complete(provider)
+        except OAuthLoginError as err:
+            app.logger.warning("%s sign-in failed: %r", provider, err.__cause__ or err)
+            return redirect(f"/?auth_error=oauth_{err.reason}")
+
+        users = get_users()
+        # Matched on the provider's account id only, never on email, so an account
+        # can't be taken over by someone registering a matching address elsewhere.
+        user = users.find_by_identity(provider, profile.subject)
+        if user is None:
+            if not app.config["ALLOW_SIGNUPS"]:
+                return redirect("/?auth_error=signup_disabled")
+            user = users.create_from_identity(provider, profile.subject, profile.username_hint, profile.email)
+        else:
+            users.record_login(user["id"])
+        start_session(user)
+        return redirect("/")
+
+    @app.post("/api/auth/logout")
+    def logout():
+        session.clear()
+        return jsonify(user=None)
+
+    # --- translation -----------------------------------------------------------
 
     @app.get("/api/health")
     def health():
@@ -179,6 +413,8 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
         )
 
     @app.post("/api/transcribe")
+    @limiter.limit(rate_limits["transcribe"], key_func=user_key)
+    @login_required
     def transcribe():
         upload = request.files.get("file")
         if upload is None:
@@ -207,6 +443,8 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
         )
 
     @app.post("/api/translate")
+    @limiter.limit(rate_limits["translate"], key_func=user_key)
+    @login_required
     def translate():
         payload = json_body()
         text = text_field(payload, "text", MAX_TEXT_CHARS, "text to translate")
@@ -225,6 +463,8 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
         )
 
     @app.post("/api/speech")
+    @limiter.limit(rate_limits["speech"], key_func=user_key)
+    @login_required
     def speech():
         payload = json_body()
         text = text_field(payload, "text", MAX_SPEECH_CHARS, "text to read aloud")
@@ -233,7 +473,11 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
         # Not cached anywhere on the server; the browser keeps its own copy.
         return Response(audio, mimetype="audio/mpeg", headers={"Cache-Control": "no-store"})
 
+    # --- sharing -----------------------------------------------------------------
+
     @app.post("/api/shares")
+    @limiter.limit(rate_limits["share"], key_func=user_key)
+    @login_required
     def create_share():
         payload = json_body()
         transcript = text_field(payload, "transcript", MAX_TEXT_CHARS, "original transcript")
@@ -263,6 +507,7 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
         )
 
     @app.get("/api/shares/<share_id>/audio")
+    @limiter.limit(rate_limits["share_audio"])
     def get_share_audio(share_id: str):
         share = find_share(share_id)
         target = stored_language(share["target_language"])
@@ -289,9 +534,21 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
             )
         return send_from_directory(FRONTEND_DIST, "index.html")
 
+    # --- errors ------------------------------------------------------------------
+
     @app.errorhandler(ApiError)
     def handle_api_error(err: ApiError):
         return error_response(err.status, err.code, err.message)
+
+    @app.errorhandler(RateLimitExceeded)
+    def handle_rate_limited(_err: RateLimitExceeded):
+        current = limiter.current_limit
+        retry_after = max(1, math.ceil(current.reset_at - time.time())) if current else 60
+        response, status = error_response(
+            429, "too_many_requests", f"Too many requests. Please wait {describe_wait(retry_after)} and try again."
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response, status
 
     @app.errorhandler(RequestEntityTooLarge)
     def handle_too_large(_err):
@@ -308,6 +565,58 @@ def create_app(service: TranslationService | None = None, data_dir: Path | None 
             return err
         code = (err.name or "error").lower().replace(" ", "_")
         return error_response(err.code or 500, code, err.description or err.name)
+
+    # --- account management (flask --app app users ...) ---------------------------
+
+    @app.cli.group("users")
+    def users_cli():
+        """Manage who can sign in."""
+
+    @users_cli.command("create")
+    @click.argument("username")
+    @click.password_option(help="The password; you are prompted for it (hidden) if omitted.")
+    def create_user_command(username: str, password: str):
+        """Create an account."""
+        try:
+            user = get_users().create(username, password)
+        except ValueError as err:
+            raise click.ClickException(str(err)) from None
+        click.echo(f"Created user '{user['username']}'. They can now sign in.")
+
+    @users_cli.command("list")
+    def list_users_command():
+        """List accounts."""
+        users = get_users().list()
+        if not users:
+            click.echo("No users yet. Create one with: flask --app app users create <username>")
+        for user in users:
+            methods = (["password"] if user["password_hash"] else []) + (user["providers"] or "").split(",")
+            last = f"last signed in {user['last_login_at']}" if user["last_login_at"] else "never signed in"
+            click.echo(
+                f"{user['username']:<24} {'+'.join(filter(None, methods)):<18} created {user['created_at']}   {last}"
+            )
+
+    @users_cli.command("set-password")
+    @click.argument("username")
+    @click.password_option(help="The new password; you are prompted for it (hidden) if omitted.")
+    def set_password_command(username: str, password: str):
+        """Change a password and sign the user out everywhere."""
+        try:
+            changed = get_users().set_password(username, password)
+        except ValueError as err:
+            raise click.ClickException(str(err)) from None
+        if not changed:
+            raise click.ClickException(f"No user named '{username}'.")
+        click.echo(f"Password changed for '{username}'. Their existing sessions have been signed out.")
+
+    @users_cli.command("delete")
+    @click.argument("username")
+    @click.confirmation_option(prompt="Delete this user? They will be signed out immediately.")
+    def delete_user_command(username: str):
+        """Delete an account."""
+        if not get_users().delete(username):
+            raise click.ClickException(f"No user named '{username}'.")
+        click.echo(f"Deleted user '{username}'.")
 
     return app
 

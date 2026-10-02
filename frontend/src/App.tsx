@@ -9,11 +9,12 @@ import { LanguagePicker } from './components/LanguagePicker'
 import { ResultCard } from './components/ResultCard'
 import { StatTiles } from './components/StatTiles'
 import { TranslationActions, entryActions } from './components/TranslationActions'
+import { UserMenu } from './components/UserMenu'
 import { Alert, Card, CardHeader, LogoMark, RetryButton } from './components/ui'
 import { formatDuration, greeting } from './lib/format'
 import { createInitialState, reducer, type Async } from './state'
 import { useHistory } from './hooks/useHistory'
-import type { AppConfig, AudioClip, HistoryEntry, Transcription } from './types'
+import type { AppConfig, AudioClip, HistoryEntry, Transcription, User } from './types'
 
 const TARGET_STORAGE_KEY = 'audio-translator:target-language'
 
@@ -30,7 +31,7 @@ function readStoredTarget(): string | null {
   }
 }
 
-export default function App() {
+export default function App({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const [config, setConfig] = useState<AppConfig | null>(null)
   const [configError, setConfigError] = useState<string | null>(null)
   const [configAttempt, setConfigAttempt] = useState(0)
@@ -207,6 +208,7 @@ export default function App() {
             </span>
           )}
         </button>
+        <UserMenu user={user} onSignOut={onSignOut} />
       </AppHeader>
 
       <main className="mx-auto max-w-6xl px-4 pb-12 sm:px-6">
@@ -218,7 +220,7 @@ export default function App() {
             </div>
           </div>
           <p className="mt-5 rounded-full sm:mt-6 bg-white/70 px-3.5 py-1 text-sm font-semibold text-ink-500 ring-1 ring-white">
-            {greeting()} 👋
+            {greeting()}, {user.username} 👋
           </p>
           <h1 className="mt-3 text-3xl font-extrabold tracking-tight text-balance text-ink-900 sm:text-[2.6rem]">
             Translate any voice, instantly
